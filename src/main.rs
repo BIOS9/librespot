@@ -37,7 +37,7 @@ use librespot::{
 use librespot::playback::mixer::alsamixer::AlsaMixer;
 
 mod player_event_handler;
-use player_event_handler::{run_program_on_sink_events, EventHandler};
+use player_event_handler::{handle_sink_events, EventHandler};
 
 fn device_id(name: &str) -> String {
     HEXLOWER.encode(&Sha1::digest(name.as_bytes()))
@@ -181,7 +181,6 @@ struct Setup {
     credentials: Option<Credentials>,
     enable_discovery: bool,
     zeroconf_port: u16,
-    player_event_program: Option<String>,
     emit_sink_events: bool,
     zeroconf_ip: Vec<std::net::IpAddr>,
 }
@@ -226,7 +225,6 @@ fn get_setup() -> Setup {
     const NORMALISATION_PREGAIN: &str = "normalisation-pregain";
     const NORMALISATION_RELEASE: &str = "normalisation-release";
     const NORMALISATION_THRESHOLD: &str = "normalisation-threshold";
-    const ONEVENT: &str = "onevent";
     #[cfg(feature = "passthrough-decoder")]
     const PASSTHROUGH: &str = "passthrough";
     const PASSWORD: &str = "password";
@@ -267,7 +265,6 @@ fn get_setup() -> Setup {
     const ENABLE_VOLUME_NORMALISATION_SHORT: &str = "N";
     const NAME_SHORT: &str = "n";
     const DISABLE_DISCOVERY_SHORT: &str = "O";
-    const ONEVENT_SHORT: &str = "o";
     #[cfg(feature = "passthrough-decoder")]
     const PASSTHROUGH_SHORT: &str = "P";
     const PASSWORD_SHORT: &str = "p";
@@ -378,7 +375,7 @@ fn get_setup() -> Setup {
     .optflag(
         EMIT_SINK_EVENTS_SHORT,
         EMIT_SINK_EVENTS,
-        "Run PROGRAM set by `--onevent` before the sink is opened and after it is closed.",
+        "Raise events before the sink is opened and after it is closed.",
     )
     .optflag(
         ENABLE_VOLUME_NORMALISATION_SHORT,
@@ -472,12 +469,6 @@ fn get_setup() -> Setup {
         PASSWORD,
         "Password used to sign in with.",
         "PASSWORD",
-    )
-    .optopt(
-        ONEVENT_SHORT,
-        ONEVENT,
-        "Run PROGRAM when a playback event occurs.",
-        "PROGRAM",
     )
     .optopt(
         ALSA_MIXER_CONTROL_SHORT,
@@ -1672,7 +1663,6 @@ fn get_setup() -> Setup {
         }
     };
 
-    let player_event_program = opt_str(ONEVENT);
     let emit_sink_events = opt_present(EMIT_SINK_EVENTS);
 
     Setup {
@@ -1688,7 +1678,6 @@ fn get_setup() -> Setup {
         credentials,
         enable_discovery,
         zeroconf_port,
-        player_event_program,
         emit_sink_events,
         zeroconf_ip,
     }
@@ -1780,17 +1769,14 @@ async fn main() {
         (backend)(device, format)
     });
 
-    if let Some(player_event_program) = setup.player_event_program.clone() {
-        _event_handler = Some(EventHandler::new(
-            player.get_player_event_channel(),
-            &player_event_program,
-        ));
+    _event_handler = Some(EventHandler::new(
+        player.get_player_event_channel()
+    ));
 
-        if setup.emit_sink_events {
-            player.set_sink_event_callback(Some(Box::new(move |sink_status| {
-                run_program_on_sink_events(sink_status, &player_event_program)
-            })));
-        }
+    if setup.emit_sink_events {
+        player.set_sink_event_callback(Some(Box::new(move |sink_status| {
+            handle_sink_events(sink_status)
+        })));
     }
 
     loop {

@@ -1,103 +1,95 @@
 use log::{debug, error, warn};
 
-use std::{collections::HashMap, process::Command, thread};
+use std::thread;
 
 use librespot::{
     metadata::audio::UniqueFields,
     playback::player::{PlayerEvent, PlayerEventChannel, SinkStatus},
 };
 
+use serde_json::{json, Value};
+
 pub struct EventHandler {
     thread_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl EventHandler {
-    pub fn new(mut player_events: PlayerEventChannel, onevent: &str) -> Self {
-        let on_event = onevent.to_string();
+    pub fn new(mut player_events: PlayerEventChannel) -> Self {
         let thread_handle = Some(thread::spawn(move || loop {
             match player_events.blocking_recv() {
                 None => break,
                 Some(event) => {
-                    let mut env_vars = HashMap::new();
+                    let mut event_name: &str = "unknown";
+                    let mut json_obj: Option<Value> = None;                    
 
-                    match event {
+                    match event.clone() {
                         PlayerEvent::PlayRequestIdChanged { play_request_id } => {
-                            env_vars.insert("PLAYER_EVENT", "play_request_id_changed".to_string());
-                            env_vars.insert("PLAY_REQUEST_ID", play_request_id.to_string());
+                            event_name = "playRequestIdChanged";
+                            json_obj = Some(json!({
+                                "playRequestId": play_request_id,
+                            }));
                         }
                         PlayerEvent::TrackChanged { audio_item } => {
+                            event_name = "trackChanged";
                             match audio_item.track_id.to_base62() {
                                 Err(e) => {
                                     warn!("PlayerEvent::TrackChanged: Invalid track id: {}", e)
                                 }
                                 Ok(id) => {
-                                    env_vars.insert("PLAYER_EVENT", "track_changed".to_string());
-                                    env_vars.insert("TRACK_ID", id);
-                                    env_vars.insert("URI", audio_item.uri);
-                                    env_vars.insert("NAME", audio_item.name);
-                                    env_vars.insert(
-                                        "COVERS",
-                                        audio_item
-                                            .covers
+                                    json_obj = Some(json!({
+                                        "trackId": id,
+                                        "uri": audio_item.uri,
+                                        "name": audio_item.name,
+                                        "covers": audio_item.covers
                                             .into_iter()
                                             .map(|c| c.url)
-                                            .collect::<Vec<String>>()
-                                            .join("\n"),
-                                    );
-                                    env_vars.insert("LANGUAGE", audio_item.language.join("\n"));
-                                    env_vars
-                                        .insert("DURATION_MS", audio_item.duration_ms.to_string());
-                                    env_vars
-                                        .insert("IS_EXPLICIT", audio_item.is_explicit.to_string());
-
-                                    match audio_item.unique_fields {
-                                        UniqueFields::Track {
-                                            artists,
-                                            album,
-                                            album_artists,
-                                            popularity,
-                                            number,
-                                            disc_number,
-                                        } => {
-                                            env_vars.insert("ITEM_TYPE", "Track".to_string());
-                                            env_vars.insert(
-                                                "ARTISTS",
-                                                artists
+                                            .collect::<Vec<String>>(),
+                                        "language": audio_item.language,
+                                        "durationMs": audio_item.duration_ms,
+                                        "isExplicit": audio_item.is_explicit,
+                                        "extraFields": match audio_item.unique_fields {
+                                            UniqueFields::Track {
+                                                artists,
+                                                album,
+                                                album_artists,
+                                                popularity,
+                                                number,
+                                                disc_number,
+                                            } => Some(json!({
+                                                "itemType": "Track",
+                                                "albumArtists": album_artists,
+                                                "album": album,
+                                                "popularity": popularity,
+                                                "number": number,
+                                                "discNumber": disc_number,
+                                                "artists": artists
                                                     .0
                                                     .into_iter()
                                                     .map(|a| a.name)
-                                                    .collect::<Vec<String>>()
-                                                    .join("\n"),
-                                            );
-                                            env_vars
-                                                .insert("ALBUM_ARTISTS", album_artists.join("\n"));
-                                            env_vars.insert("ALBUM", album);
-                                            env_vars.insert("POPULARITY", popularity.to_string());
-                                            env_vars.insert("NUMBER", number.to_string());
-                                            env_vars.insert("DISC_NUMBER", disc_number.to_string());
-                                        }
-                                        UniqueFields::Episode {
-                                            description,
-                                            publish_time,
-                                            show_name,
-                                        } => {
-                                            env_vars.insert("ITEM_TYPE", "Episode".to_string());
-                                            env_vars.insert("DESCRIPTION", description);
-                                            env_vars.insert(
-                                                "PUBLISH_TIME",
-                                                publish_time.unix_timestamp().to_string(),
-                                            );
-                                            env_vars.insert("SHOW_NAME", show_name);
-                                        }
-                                    }
+                                                    .collect::<Vec<String>>(),
+                                            })),
+                                            UniqueFields::Episode {
+                                                description,
+                                                publish_time,
+                                                show_name,
+                                            } => Some(json!({
+                                                "itemType": "Episode",
+                                                "description": description,
+                                                "publishTime": publish_time.unix_timestamp(),
+                                                "showName": show_name,
+                                            })),
+                                        },
+                                    }));
                                 }
                             }
                         }
                         PlayerEvent::Stopped { track_id, .. } => match track_id.to_base62() {
                             Err(e) => warn!("PlayerEvent::Stopped: Invalid track id: {}", e),
                             Ok(id) => {
-                                env_vars.insert("PLAYER_EVENT", "stopped".to_string());
-                                env_vars.insert("TRACK_ID", id);
+                                event_name = "stopped";
+                                json_obj = Some(json!({
+                                    "trackId": id,
+                                }));
                             }
                         },
                         PlayerEvent::Playing {
@@ -107,9 +99,11 @@ impl EventHandler {
                         } => match track_id.to_base62() {
                             Err(e) => warn!("PlayerEvent::Playing: Invalid track id: {}", e),
                             Ok(id) => {
-                                env_vars.insert("PLAYER_EVENT", "playing".to_string());
-                                env_vars.insert("TRACK_ID", id);
-                                env_vars.insert("POSITION_MS", position_ms.to_string());
+                                event_name = "playing";
+                                json_obj = Some(json!({
+                                    "trackId": id,
+                                    "positionMs": position_ms,
+                                }));
                             }
                         },
                         PlayerEvent::Paused {
@@ -119,23 +113,29 @@ impl EventHandler {
                         } => match track_id.to_base62() {
                             Err(e) => warn!("PlayerEvent::Paused: Invalid track id: {}", e),
                             Ok(id) => {
-                                env_vars.insert("PLAYER_EVENT", "paused".to_string());
-                                env_vars.insert("TRACK_ID", id);
-                                env_vars.insert("POSITION_MS", position_ms.to_string());
+                                event_name = "paused";
+                                json_obj = Some(json!({
+                                    "trackId": id,
+                                    "positionMs": position_ms,
+                                }));
                             }
                         },
                         PlayerEvent::Loading { track_id, .. } => match track_id.to_base62() {
                             Err(e) => warn!("PlayerEvent::Loading: Invalid track id: {}", e),
                             Ok(id) => {
-                                env_vars.insert("PLAYER_EVENT", "loading".to_string());
-                                env_vars.insert("TRACK_ID", id);
+                                event_name = "loading";
+                                json_obj = Some(json!({
+                                    "trackId": id,
+                                }));
                             }
                         },
                         PlayerEvent::Preloading { track_id, .. } => match track_id.to_base62() {
                             Err(e) => warn!("PlayerEvent::Preloading: Invalid track id: {}", e),
                             Ok(id) => {
-                                env_vars.insert("PLAYER_EVENT", "preloading".to_string());
-                                env_vars.insert("TRACK_ID", id);
+                                event_name = "preloading";
+                                json_obj = Some(json!({
+                                    "trackId": id,
+                                }));
                             }
                         },
                         PlayerEvent::TimeToPreloadNextTrack { track_id, .. } => {
@@ -145,28 +145,36 @@ impl EventHandler {
                                     e
                                 ),
                                 Ok(id) => {
-                                    env_vars.insert("PLAYER_EVENT", "preload_next".to_string());
-                                    env_vars.insert("TRACK_ID", id);
+                                    event_name = "timeToPreloadNextTrack";
+                                    json_obj = Some(json!({
+                                        "trackId": id,
+                                    }));
                                 }
                             }
                         }
                         PlayerEvent::EndOfTrack { track_id, .. } => match track_id.to_base62() {
                             Err(e) => warn!("PlayerEvent::EndOfTrack: Invalid track id: {}", e),
                             Ok(id) => {
-                                env_vars.insert("PLAYER_EVENT", "end_of_track".to_string());
-                                env_vars.insert("TRACK_ID", id);
+                                event_name = "endOfTrack";
+                                json_obj = Some(json!({
+                                    "trackId": id,
+                                }));
                             }
                         },
                         PlayerEvent::Unavailable { track_id, .. } => match track_id.to_base62() {
                             Err(e) => warn!("PlayerEvent::Unavailable: Invalid track id: {}", e),
                             Ok(id) => {
-                                env_vars.insert("PLAYER_EVENT", "unavailable".to_string());
-                                env_vars.insert("TRACK_ID", id);
+                                event_name = "unavailable";
+                                json_obj = Some(json!({
+                                    "trackId": id,
+                                }));
                             }
                         },
                         PlayerEvent::VolumeChanged { volume } => {
-                            env_vars.insert("PLAYER_EVENT", "volume_changed".to_string());
-                            env_vars.insert("VOLUME", volume.to_string());
+                            event_name = "volumeChanged";
+                            json_obj = Some(json!({
+                                "volume": volume,
+                            }));
                         }
                         PlayerEvent::Seeked {
                             track_id,
@@ -175,9 +183,11 @@ impl EventHandler {
                         } => match track_id.to_base62() {
                             Err(e) => warn!("PlayerEvent::Seeked: Invalid track id: {}", e),
                             Ok(id) => {
-                                env_vars.insert("PLAYER_EVENT", "seeked".to_string());
-                                env_vars.insert("TRACK_ID", id);
-                                env_vars.insert("POSITION_MS", position_ms.to_string());
+                                event_name = "seeked";
+                                json_obj = Some(json!({
+                                    "trackId": id,
+                                    "positionMs": position_ms,
+                                }));
                             }
                         },
                         PlayerEvent::PositionCorrection {
@@ -189,26 +199,32 @@ impl EventHandler {
                                 warn!("PlayerEvent::PositionCorrection: Invalid track id: {}", e)
                             }
                             Ok(id) => {
-                                env_vars.insert("PLAYER_EVENT", "position_correction".to_string());
-                                env_vars.insert("TRACK_ID", id);
-                                env_vars.insert("POSITION_MS", position_ms.to_string());
+                                event_name = "positionCorrection";
+                                json_obj = Some(json!({
+                                    "trackId": id,
+                                    "positionMs": position_ms,
+                                }));
                             }
                         },
                         PlayerEvent::SessionConnected {
                             connection_id,
                             user_name,
                         } => {
-                            env_vars.insert("PLAYER_EVENT", "session_connected".to_string());
-                            env_vars.insert("CONNECTION_ID", connection_id);
-                            env_vars.insert("USER_NAME", user_name);
+                            event_name = "sessionConnected";
+                            json_obj = Some(json!({
+                                "connectionId": connection_id,
+                                "userName": user_name,
+                            }));
                         }
                         PlayerEvent::SessionDisconnected {
                             connection_id,
                             user_name,
                         } => {
-                            env_vars.insert("PLAYER_EVENT", "session_disconnected".to_string());
-                            env_vars.insert("CONNECTION_ID", connection_id);
-                            env_vars.insert("USER_NAME", user_name);
+                            event_name = "sessionDisconnected";
+                            json_obj = Some(json!({
+                                "connectionId": connection_id,
+                                "userName": user_name,
+                            }));
                         }
                         PlayerEvent::SessionClientChanged {
                             client_id,
@@ -216,36 +232,51 @@ impl EventHandler {
                             client_brand_name,
                             client_model_name,
                         } => {
-                            env_vars.insert("PLAYER_EVENT", "session_client_changed".to_string());
-                            env_vars.insert("CLIENT_ID", client_id);
-                            env_vars.insert("CLIENT_NAME", client_name);
-                            env_vars.insert("CLIENT_BRAND_NAME", client_brand_name);
-                            env_vars.insert("CLIENT_MODEL_NAME", client_model_name);
+                            event_name = "sessionClientChanged";
+                            json_obj = Some(json!({
+                                "clientId": client_id,
+                                "clientName": client_name,
+                                "clientBrandName": client_brand_name,
+                                "cleintModelName": client_model_name,
+                            }));
                         }
                         PlayerEvent::ShuffleChanged { shuffle } => {
-                            env_vars.insert("PLAYER_EVENT", "shuffle_changed".to_string());
-                            env_vars.insert("SHUFFLE", shuffle.to_string());
+                            event_name = "shuffleChanged";
+                            json_obj = Some(json!({
+                                "shuffle": shuffle,
+                            }));
                         }
                         PlayerEvent::RepeatChanged { repeat } => {
-                            env_vars.insert("PLAYER_EVENT", "repeat_changed".to_string());
-                            env_vars.insert("REPEAT", repeat.to_string());
+                            event_name = "repeatChanged";
+                            json_obj = Some(json!({
+                                "repeat": repeat,
+                            }));
                         }
                         PlayerEvent::AutoPlayChanged { auto_play } => {
-                            env_vars.insert("PLAYER_EVENT", "auto_play_changed".to_string());
-                            env_vars.insert("AUTO_PLAY", auto_play.to_string());
+                            event_name = "autoPlayChanged";
+                            json_obj = Some(json!({
+                                "autoPlay": auto_play,
+                            }));
                         }
 
                         PlayerEvent::FilterExplicitContentChanged { filter } => {
-                            env_vars.insert(
-                                "PLAYER_EVENT",
-                                "filter_explicit_content_changed".to_string(),
-                            );
-                            env_vars.insert("FILTER", filter.to_string());
+                            event_name = "filterExplicitContentChanged";
+                            json_obj = Some(json!({
+                                "filter": filter,
+                            }));
                         }
                     }
 
-                    if !env_vars.is_empty() {
-                        run_program(env_vars, &on_event);
+                    if let Some(json_obj) = json_obj {
+                        match serde_json::to_string(&json_obj) {
+                            Ok(s) => {
+                                eprintln!("raise_event {} {}", event_name, s);
+                            },
+                            Err(e) => {
+                                warn!("Failed to serialize PlayerEvent: {}", e);
+                                continue;
+                            }
+                        };
                     }
                 }
             }
@@ -266,46 +297,12 @@ impl Drop for EventHandler {
     }
 }
 
-pub fn run_program_on_sink_events(sink_status: SinkStatus, onevent: &str) {
-    let mut env_vars = HashMap::new();
-
-    env_vars.insert("PLAYER_EVENT", "sink".to_string());
-
-    let sink_status = match sink_status {
-        SinkStatus::Running => "running",
-        SinkStatus::TemporarilyClosed => "temporarily_closed",
-        SinkStatus::Closed => "closed",
-    };
-
-    env_vars.insert("SINK_STATUS", sink_status.to_string());
-
-    run_program(env_vars, onevent);
-}
-
-fn run_program(env_vars: HashMap<&str, String>, onevent: &str) {
-    let mut v: Vec<&str> = onevent.split_whitespace().collect();
-
-    debug!(
-        "Running {} with environment variables:\n{:#?}",
-        onevent, env_vars
-    );
-
-    match Command::new(v.remove(0))
-        .args(&v)
-        .envs(env_vars.iter())
-        .spawn()
-    {
-        Err(e) => warn!("On event program {} failed to start: {}", onevent, e),
-        Ok(mut child) => match child.wait() {
-            Err(e) => warn!("On event program {} failed: {}", onevent, e),
-            Ok(e) if e.success() => (),
-            Ok(e) => {
-                if let Some(code) = e.code() {
-                    warn!("On event program {} returned exit code {}", onevent, code);
-                } else {
-                    warn!("On event program {} returned failure: {}", onevent, e);
-                }
-            }
-        },
-    }
+pub fn handle_sink_events(sink_status: SinkStatus) {
+    eprintln!("raise_event sink {}", json!({
+        "sinkStatus": match sink_status {
+            SinkStatus::Running => "running",
+            SinkStatus::TemporarilyClosed => "temporarily_closed",
+            SinkStatus::Closed => "closed",
+        }
+    }));
 }
